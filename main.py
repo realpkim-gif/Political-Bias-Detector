@@ -12,7 +12,6 @@ device="cuda" if torch.cuda.is_available() else "cpu"
 tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-large-uncased")
 model = AutoModelForMaskedLM.from_pretrained("google-bert/bert-large-uncased", device_map=device)
 
-
 def load_allsides_data():
     # This dataset's files have mixed encodings (mostly utf-8, some cp1252),
     # so the generic `datasets` text loader can't decode all of them with one setting.
@@ -35,8 +34,10 @@ def load_allsides_data():
             rows.append({"text": text, "label": label})
     return pd.DataFrame(rows)
 
-
 df = load_allsides_data()
+df.dropna(inplace=True)
+print(df.shape)
+
 df.to_csv('data_finetune.csv', index=False)
 
 def get_embedding(text, device):
@@ -45,8 +46,6 @@ def get_embedding(text, device):
         outputs = model(**inputs)
     #** unpacks input/attention mask dictionary into two lists.
     return outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
-
-
 
 class SimpleNeuralNet(nn.Module):
     def __init__(self, input_size, hidden_size, num_classes):
@@ -61,11 +60,10 @@ class SimpleNeuralNet(nn.Module):
 final_model = SimpleNeuralNet(input_size=10, hidden_size=20, num_classes=2)
 
 # Create a mock batch of data (batch size of 4, 10 features each)
-mock_input = torch.randn(4, 10)
+#mock_input = torch.randn(4, 10)
 
 # Run the forward pass
-predictions = model(mock_input)
-
+#predictions = model(mock_input)
 
 # check the actual field names first
 print(df['text'][0])
