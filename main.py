@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, AutoModelForMaskedLM
+from transformers import AutoTokenizer, AutoModel
 from huggingface_hub import hf_hub_download
 import zipfile
 import numpy as np
@@ -6,11 +6,18 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from sklearn.model_selection import train_test_split
+
 
 device="cuda" if torch.cuda.is_available() else "cpu"
 
 tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-large-uncased")
-model = AutoModelForMaskedLM.from_pretrained("google-bert/bert-large-uncased", device_map=device)
+model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
+model.eval() #turn off drop out layers to make stable
+
+for param in model.parameters(): #no backprop
+    param.requires_grad = False
 
 def load_allsides_data():
     # This dataset's files have mixed encodings (mostly utf-8, some cp1252),
@@ -38,32 +45,79 @@ df = load_allsides_data()
 df.dropna(inplace=True)
 print(df.shape)
 
+#End of data preprocessing
+X=[]
+Y=[]
+# Split data into 80% training and 20% testing
+X_train, X_test, y_train, y_test = train_test_split(
+    X, Y, test_size=0.10, random_state=42
+)
+
 df.to_csv('data_finetune.csv', index=False)
 
-def get_embedding(text, device):
-    inputs = tokenizer(text, return_tensors="tf", truncation=True, max_length=1024, padding=True).to(device)
+num_epochs=50
+
+def get_embedding(text, device): #(using BERT)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True).to(device)
     with torch.no_grad():
-        outputs = model(**inputs)
-    #** unpacks input/attention mask dictionary into two lists.
-    return outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy()
+        outputs = model(**inputs) #** unpacks input/attention mask dictionary into two lists.
+
+    return outputs.last_hidden_state.mean(dim=1)  # (batch, 1024) tensor, stays on device
 
 class SimpleNeuralNet(nn.Module):
-    def __init__(self, input_size, hidden_size, num_classes):
+    def __init__(self, input_size, hidden_size, num_classes): #initiallize
         super(SimpleNeuralNet, self).__init__()
 
-        embedding = get_embedding(df["text"], device)
-
-        self.fc1 = nn.ReLU(input_size, hidden_size)  # Fully Connected Layer 1
+        self.fc1 = nn.Linear(input_size, hidden_size)  # Fully Connected Layer 1
         self.fc2 = nn.Linear(hidden_size, hidden_size)  # Fully Connected Layer 2
-        self.fc3 = nn.Softmax(hidden_size, num_classes) # Softmax for probability prediction
+        self.fc3 = nn.Linear(hidden_size, num_classes)  # Outputs logits; use CrossEntropyLoss (applies softmax)
 
-final_model = SimpleNeuralNet(input_size=10, hidden_size=20, num_classes=2)
+    def forward(self, test_input): #internally called
+        x = get_embedding(test_input, device)  # BERT embedding is the starting input
+        x = F.relu(self.fc1(x)) #maintains shape
+        x = F.relu(self.fc2(x)) #maintains shape
+        scores = self.fc3(x)  # (batch, 3) raw scores
+        return scores
 
-# Create a mock batch of data (batch size of 4, 10 features each)
-#mock_input = torch.randn(4, 10)
+loss_function = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters())
 
-# Run the forward pass
-#predictions = model(mock_input)
 
-# check the actual field names first
-print(df['text'][0])
+train_loader = DataLoader(
+    dataset=df, #Outputs C1 and C2 as test-input and test-output
+    batch_size=64,
+    shuffle=True
+)
+#returns batch_idx, (test_input, test_output)
+
+#applying optimization
+def train(model, optimizer, loss_function, train_loader):
+    for epoch in range(num_epochs):
+        print(f"--- Epoch {epoch + 1} ---")
+
+        # Iterate over batches
+        for batch_idx, (test_input, test_output) in enumerate(train_loader):
+            output = model(test_input) #test_input for the get_embedding
+            loss = loss_function(output, test_output.to(device))  # compare scores to the true labels
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+# BERT-large embeddings are 1024-dim; 3 classes: LEFT, CENTER, RIGHT (from get_embeddings)
+final_model = SimpleNeuralNet(input_size=1024, hidden_size=256, num_classes=3).to(device)
+final_model.train()
+train(final_model, optimizer, loss_function, train_loader)
+
+final_model.eval()                    # dropout off
+with torch.no_grad():          # no gradient tracking for specific (diff way than BERT but same thing, only in that block with this)
+    #with is try and finally (to close) but simpler
+    inputs = df["C1"].tolist()[:-1]    # list of strings, not a bare string
+    scores = final_model(inputs)        # (batch, 3) raw scores
+    pred = scores.argmax(dim=1)   # 0/1/2 = LEFT/CENTER/RIGHT
+
+
+id_to_label = {0: "LEFT", 1: "CENTER", 2: "RIGHT"}
+print([id_to_label[i.item()] for i in pred])
+
+
