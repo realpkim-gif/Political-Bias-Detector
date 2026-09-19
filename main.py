@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, AutoModelForMaskedLM
+from transformers import AutoTokenizer, AutoModel
 from huggingface_hub import hf_hub_download
 import zipfile
 import numpy as np
@@ -10,7 +10,8 @@ import torch.nn.functional as F
 device="cuda" if torch.cuda.is_available() else "cpu"
 
 tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-large-uncased")
-model = AutoModelForMaskedLM.from_pretrained("google-bert/bert-large-uncased", device_map=device)
+model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
+model.eval()
 
 def load_allsides_data():
     # This dataset's files have mixed encodings (mostly utf-8, some cp1252),
@@ -41,7 +42,7 @@ print(df.shape)
 df.to_csv('data_finetune.csv', index=False)
 
 def get_embedding(text, device):
-    inputs = tokenizer(text, return_tensors="tf", truncation=True, max_length=1024, padding=True).to(device)
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True).to(device)
     with torch.no_grad():
         outputs = model(**inputs)
     #** unpacks input/attention mask dictionary into two lists.
@@ -51,13 +52,17 @@ class SimpleNeuralNet(nn.Module):
     def __init__(self, input_size, hidden_size, num_classes):
         super(SimpleNeuralNet, self).__init__()
 
-        embedding = get_embedding(df["text"], device)
-
-        self.fc1 = nn.ReLU(input_size, hidden_size)  # Fully Connected Layer 1
+        self.fc1 = nn.Linear(input_size, hidden_size)  # Fully Connected Layer 1
         self.fc2 = nn.Linear(hidden_size, hidden_size)  # Fully Connected Layer 2
-        self.fc3 = nn.Softmax(hidden_size, num_classes) # Softmax for probability prediction
+        self.fc3 = nn.Linear(hidden_size, num_classes)  # Outputs logits; use CrossEntropyLoss (applies softmax)
 
-final_model = SimpleNeuralNet(input_size=10, hidden_size=20, num_classes=2)
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)
+
+# BERT-large embeddings are 1024-dim; 3 classes: LEFT, CENTER, RIGHT
+final_model = SimpleNeuralNet(input_size=1024, hidden_size=256, num_classes=3)
 
 # Create a mock batch of data (batch size of 4, 10 features each)
 #mock_input = torch.randn(4, 10)
