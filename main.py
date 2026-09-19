@@ -109,37 +109,15 @@ final_model = SimpleNeuralNet(input_size=1024, hidden_size=256, num_classes=3).t
 final_model.train()
 train(final_model, optimizer, loss_function, train_loader)
 
-#To convert raw logit to id
-id_to_label = {0: "LEFT", 1: "CENTER", 2: "RIGHT"}
-
-#score with train data
 final_model.eval()                    # dropout off
 with torch.no_grad():          # no gradient tracking for specific (diff way than BERT but same thing, only in that block with this)
     #with is try and finally (to close) but simpler
     inputs = df["C1"].tolist()[:-1]    # list of strings, not a bare string
     scores = final_model(inputs)        # (batch, 3) raw scores
     pred = scores.argmax(dim=1)   # 0/1/2 = LEFT/CENTER/RIGHT
-    pred = id_to_label[pred]
 
 
-#End of train and testing model
-with torch.nograd():
-    inputs = X_test.tolist()[:-1]
-    scores= final_model(inputs)
-    pred = scores.argmax(dim=1)
-    pred = id_to_label[pred]
+id_to_label = {0: "LEFT", 1: "CENTER", 2: "RIGHT"}
+print([id_to_label[i.item()] for i in pred])
 
-    correct=0
-    incorrect=0
 
-    if scores== pred:
-        correct += 1
-    else:
-        incorrect += 1
-
-    percentage = scores / pred
-
-    print(f"accuracy: {percentage}")
-
-predicted_labels = [id_to_label[i.item()] for i in pred]
-print(predicted_labels)
