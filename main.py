@@ -8,9 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
-
+from torchmetrics.functional import accuracy, precision, recall, f1_score
 
 device="cuda" if torch.cuda.is_available() else "cpu"
+print(device)
 
 tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-large-uncased")
 model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
@@ -43,11 +44,15 @@ def load_allsides_data():
 
 df = load_allsides_data()
 df.dropna(inplace=True)
+label_to_id = {"LEFT": 0, "CENTER": 1, "RIGHT": 2}
+df["label"] = df["label"].map(label_to_id)
 print(df.shape)
 
-#End of data preprocessing
-X=[]
-Y=[]
+max_lengths_all_columns = df.astype(str).map(len).max()
+print("max length "+max_lengths_all_columns)
+
+X=df["text"]
+Y=df["label"]
 # Split data into 80% training and 20% testing
 X_train, X_test, y_train, y_test = train_test_split(
     X, Y, test_size=0.10, random_state=42
@@ -56,6 +61,22 @@ X_train, X_test, y_train, y_test = train_test_split(
 df.to_csv('data_finetune.csv', index=False)
 
 num_epochs=50
+
+#Dataloader needs the index and data/lable for test, need to make a class like this for pytorch (internally calls these methods)
+class TextLabelDataset(torch.utils.data.Dataset):
+    def __init__(self, texts, labels):
+        self.texts = texts.tolist()
+        self.labels = labels.tolist()
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        return self.texts[idx], self.labels[idx]
+
+
+#End of data preprocessing
+
 
 def get_embedding(text, device): #(using BERT)
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True).to(device)
@@ -79,12 +100,15 @@ class SimpleNeuralNet(nn.Module):
         scores = self.fc3(x)  # (batch, 3) raw scores
         return scores
 
-loss_function = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters())
 
+# BERT-large embeddings are 1024-dim; 3 classes: LEFT, CENTER, RIGHT (from get_embeddings)
+final_model = SimpleNeuralNet(input_size=1024, hidden_size=256, num_classes=3).to(device)
+
+loss_function = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(final_model.parameters())  # only the classifier head is trainable; BERT is frozen
 
 train_loader = DataLoader(
-    dataset=df, #Outputs C1 and C2 as test-input and test-output
+    dataset=TextLabelDataset(X_train, y_train),
     batch_size=64,
     shuffle=True
 )
@@ -104,42 +128,23 @@ def train(model, optimizer, loss_function, train_loader):
             loss.backward()
             optimizer.step()
 
-# BERT-large embeddings are 1024-dim; 3 classes: LEFT, CENTER, RIGHT (from get_embeddings)
-final_model = SimpleNeuralNet(input_size=1024, hidden_size=256, num_classes=3).to(device)
 final_model.train()
 train(final_model, optimizer, loss_function, train_loader)
 
 #To convert raw logit to id
 id_to_label = {0: "LEFT", 1: "CENTER", 2: "RIGHT"}
 
-#score with train data
+#End of train and testing model
 final_model.eval()                    # dropout off
 with torch.no_grad():          # no gradient tracking for specific (diff way than BERT but same thing, only in that block with this)
     #with is try and finally (to close) but simpler
-    inputs = df["C1"].tolist()[:-1]    # list of strings, not a bare string
+    inputs = X_test.tolist()
     scores = final_model(inputs)        # (batch, 3) raw scores
     pred = scores.argmax(dim=1)   # 0/1/2 = LEFT/CENTER/RIGHT
-    pred = id_to_label[pred]
 
+    y_true = torch.tensor(y_test.tolist(), device=device)
 
-#End of train and testing model
-with torch.nograd():
-    inputs = X_test.tolist()[:-1]
-    scores= final_model(inputs)
-    pred = scores.argmax(dim=1)
-    pred = id_to_label[pred]
-
-    correct=0
-    incorrect=0
-
-    if scores== pred:
-        correct += 1
-    else:
-        incorrect += 1
-
-    percentage = scores / pred
-
-    print(f"accuracy: {percentage}")
-
-predicted_labels = [id_to_label[i.item()] for i in pred]
-print(predicted_labels)
+    acc = accuracy(pred, y_true, task="multiclass", num_classes=3)
+    prec = precision(pred, y_true, task="multiclass", num_classes=3, average="macro")
+    rec = recall(pred, y_true, task="multiclass", num_classes=3, average="macro")
+    f1 = f1_score(pred, y_true, task="multiclass", num_classes=3, average="macro")
