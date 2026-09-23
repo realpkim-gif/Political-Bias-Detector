@@ -49,13 +49,16 @@ df["label"] = df["label"].map(label_to_id)
 print(df.shape)
 
 max_lengths_all_columns = df.astype(str).map(len).max()
-print("max length "+max_lengths_all_columns)
+print("max length", max_lengths_all_columns)
 
 X=df["text"]
 Y=df["label"]
-# Split data into 80% training and 20% testing
+# Split data into 80% training, 10% validation, 10% testing
 X_train, X_test, y_train, y_test = train_test_split(
     X, Y, test_size=0.10, random_state=42
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train, y_train, test_size=0.10, random_state=42
 )
 
 df.to_csv('data_finetune.csv', index=False)
@@ -115,21 +118,61 @@ train_loader = DataLoader(
 #returns batch_idx, (test_input, test_output)
 
 #applying optimization
-def train(model, optimizer, loss_function, train_loader):
+def train(model, optimizer, loss_function, train_loader, patience, train_name):
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
+    history = {"epoch": [], "loss": [], "val_loss": []}
+
     for epoch in range(num_epochs):
-        print(f"--- Epoch {epoch + 1} ---")
-
-        # Iterate over batches
+        model.train()
+        running_loss = 0.0
         for batch_idx, (test_input, test_output) in enumerate(train_loader):
-            output = model(test_input) #test_input for the get_embedding
-            loss = loss_function(output, test_output.to(device))  # compare scores to the true labels
-
+            output = model(test_input)
+            loss = loss_function(output, test_output.to(device))
+            running_loss += loss.item()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+        avg_train_loss = running_loss / len(train_loader)
+
+        #evaluate with val
+        model.eval()
+        with torch.no_grad():
+            val_scores = model(X_val.tolist())
+            val_loss = loss_function(val_scores, torch.tensor(y_val.tolist(), device=device)).item()
+
+        history["epoch"].append(epoch + 1)
+        history["loss"].append(avg_train_loss)
+        history["val_loss"].append(val_loss)
+
+        #early stop
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= patience:
+                print(f"Early stopping at epoch {epoch + 1}")
+                break
+
+        hist_data = pd.DataFrame(history)
+        hist_data.to_csv(f"{train_name}.csv", index=False)
+
 final_model.train()
-train(final_model, optimizer, loss_function, train_loader)
+
+train(final_model, optimizer, loss_function, train_loader, 5, "model_patience_5")
+torch.save(final_model.state_dict(), 'model_patience_5.pt')
+
+
+# fresh model + optimizer, so this run doesn't continue from the patience=5 run above
+final_model = SimpleNeuralNet(input_size=1024, hidden_size=256, num_classes=3).to(device)
+optimizer = torch.optim.Adam(final_model.parameters())
+final_model.train()
+
+train(final_model, optimizer, loss_function, train_loader, 10, "model_patience_10")
+torch.save(final_model.state_dict(), 'model_patience_10.pt')
+
+
 
 #To convert raw logit to id
 id_to_label = {0: "LEFT", 1: "CENTER", 2: "RIGHT"}
@@ -148,3 +191,5 @@ with torch.no_grad():          # no gradient tracking for specific (diff way tha
     prec = precision(pred, y_true, task="multiclass", num_classes=3, average="macro")
     rec = recall(pred, y_true, task="multiclass", num_classes=3, average="macro")
     f1 = f1_score(pred, y_true, task="multiclass", num_classes=3, average="macro")
+
+    print(acc, prec, rec, f1)
