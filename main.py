@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 from torchmetrics.functional import accuracy, precision, recall, f1_score
+import re
 
 device="cuda" if torch.cuda.is_available() else "cpu"
 print(device)
@@ -44,6 +45,15 @@ def load_allsides_data():
 
 df = load_allsides_data()
 df.dropna(inplace=True)
+
+# drop extreme length outliers (likely corrupted/concatenated files, not real articles)
+text_lengths = df["text"].str.len()
+df = df[text_lengths < text_lengths.quantile(0.99)]
+df = df[df["text"].str.contains(r"\S", regex=True, na=False)]
+df.drop_duplicates(subset="text", inplace=True)
+
+df.reset_index(drop=True, inplace=True)
+
 label_to_id = {"LEFT": 0, "CENTER": 1, "RIGHT": 2}
 df["label"] = df["label"].map(label_to_id)
 print(df.shape)
@@ -115,6 +125,17 @@ train_loader = DataLoader(
     batch_size=64,
     shuffle=True
 )
+
+def predict_in_batches(model, texts, labels):
+    loader = DataLoader(TextLabelDataset(texts, labels), batch_size=64, shuffle=False)
+    all_scores = []
+    all_labels = []
+    for batch_texts, batch_labels in loader:
+        all_scores.append(model(batch_texts))
+        all_labels.append(batch_labels)
+    return torch.cat(all_scores, dim=0), torch.cat(all_labels, dim=0)
+
+
 #returns batch_idx, (test_input, test_output)
 
 #applying optimization
@@ -139,8 +160,8 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
         #evaluate with val
         model.eval()
         with torch.no_grad():
-            val_scores = model(X_val.tolist())
-            val_loss = loss_function(val_scores, torch.tensor(y_val.tolist(), device=device)).item()
+            val_scores, val_labels = predict_in_batches(model, X_val.tolist(), y_val.tolist())
+            val_loss = loss_function(val_scores, val_labels.to(device)).item()
 
         history["epoch"].append(epoch + 1)
         history["loss"].append(avg_train_loss)
@@ -158,38 +179,25 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
         hist_data = pd.DataFrame(history)
         hist_data.to_csv(f"{train_name}.csv", index=False)
 
-final_model.train()
 
 train(final_model, optimizer, loss_function, train_loader, 5, "model_patience_5")
 torch.save(final_model.state_dict(), 'model_patience_5.pt')
 
 
-# fresh model + optimizer, so this run doesn't continue from the patience=5 run above
-final_model = SimpleNeuralNet(input_size=1024, hidden_size=256, num_classes=3).to(device)
-optimizer = torch.optim.Adam(final_model.parameters())
-final_model.train()
-
-train(final_model, optimizer, loss_function, train_loader, 10, "model_patience_10")
-torch.save(final_model.state_dict(), 'model_patience_10.pt')
-
-
-
-#To convert raw logit to id
-id_to_label = {0: "LEFT", 1: "CENTER", 2: "RIGHT"}
-
-#End of train and testing model
+#End of train and TEST model
 final_model.eval()                    # dropout off
 with torch.no_grad():          # no gradient tracking for specific (diff way than BERT but same thing, only in that block with this)
     #with is try and finally (to close) but simpler
     inputs = X_test.tolist()
-    scores = final_model(inputs)        # (batch, 3) raw scores
+    scores, y_test_true = predict_in_batches(final_model, inputs, y_test.tolist())        # (batch, 3) raw scores
+
     pred = scores.argmax(dim=1)   # 0/1/2 = LEFT/CENTER/RIGHT
 
-    y_true = torch.tensor(y_test.tolist(), device=device)
+    y_test_true = y_test_true.to(device)
 
-    acc = accuracy(pred, y_true, task="multiclass", num_classes=3)
-    prec = precision(pred, y_true, task="multiclass", num_classes=3, average="macro")
-    rec = recall(pred, y_true, task="multiclass", num_classes=3, average="macro")
-    f1 = f1_score(pred, y_true, task="multiclass", num_classes=3, average="macro")
+    acc = accuracy(pred, y_test_true, task="multiclass", num_classes=3)
+    prec = precision(pred, y_test_true, task="multiclass", num_classes=3, average="macro")
+    rec = recall(pred, y_test_true, task="multiclass", num_classes=3, average="macro")
+    f1 = f1_score(pred, y_test_true, task="multiclass", num_classes=3, average="macro")
 
     print(acc, prec, rec, f1)
