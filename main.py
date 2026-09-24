@@ -16,7 +16,7 @@ print(device)
 
 tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-large-uncased")
 model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
-model.eval() #turn off drop out layers to make stable
+model.eval() #turn off dropout layers to make stable
 
 for param in model.parameters(): #no backprop
     param.requires_grad = False
@@ -63,10 +63,12 @@ print("max length", max_lengths_all_columns)
 
 X=df["text"]
 Y=df["label"]
+
 # Split data into 80% training, 10% validation, 10% testing
 X_train, X_test, y_train, y_test = train_test_split(
     X, Y, test_size=0.10, random_state=42
 )
+
 X_train, X_val, y_train, y_val = train_test_split(
     X_train, y_train, test_size=0.10, random_state=42
 )
@@ -78,8 +80,8 @@ num_epochs=50
 #Dataloader needs the index and data/lable for test, need to make a class like this for pytorch (internally calls these methods)
 class TextLabelDataset(torch.utils.data.Dataset):
     def __init__(self, texts, labels):
-        self.texts = texts.tolist()
-        self.labels = labels.tolist()
+        self.texts = list(texts)
+        self.labels = list(labels)
 
     def __len__(self):
         return len(self.texts)
@@ -160,7 +162,7 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
         #evaluate with val
         model.eval()
         with torch.no_grad():
-            val_scores, val_labels = predict_in_batches(model, X_val.tolist(), y_val.tolist())
+            val_scores, val_labels = predict_in_batches(model, list(X_val), list(y_val))
             val_loss = loss_function(val_scores, val_labels.to(device)).item()
 
         history["epoch"].append(epoch + 1)
@@ -176,8 +178,9 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
                 print(f"Early stopping at epoch {epoch + 1}")
                 break
 
-        hist_data = pd.DataFrame(history)
-        hist_data.to_csv(f"{train_name}.csv", index=False)
+    # save training history once training is finished (not every epoch)
+    hist_data = pd.DataFrame(history)
+    hist_data.to_csv(f"{train_name}.csv", index=False)
 
 
 train(final_model, optimizer, loss_function, train_loader, 5, "model_patience_5")
@@ -188,8 +191,8 @@ torch.save(final_model.state_dict(), 'model_patience_5.pt')
 final_model.eval()                    # dropout off
 with torch.no_grad():          # no gradient tracking for specific (diff way than BERT but same thing, only in that block with this)
     #with is try and finally (to close) but simpler
-    inputs = X_test.tolist()
-    scores, y_test_true = predict_in_batches(final_model, inputs, y_test.tolist())        # (batch, 3) raw scores
+    inputs = list(X_test)
+    scores, y_test_true = predict_in_batches(final_model, inputs, list(y_test))        # (batch, 3) raw scores
 
     pred = scores.argmax(dim=1)   # 0/1/2 = LEFT/CENTER/RIGHT
 
@@ -201,3 +204,12 @@ with torch.no_grad():          # no gradient tracking for specific (diff way tha
     f1 = f1_score(pred, y_test_true, task="multiclass", num_classes=3, average="macro")
 
     print(acc, prec, rec, f1)
+
+    test_metrics = pd.DataFrame([{
+        "accuracy": acc.item(),
+        "precision": prec.item(),
+        "recall": rec.item(),
+        "f1": f1.item(),
+    }])
+    test_metrics.to_csv("test_metrics.csv", index=False)
+
