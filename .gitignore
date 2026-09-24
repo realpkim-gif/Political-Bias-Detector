@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated model outputs (regenerate by running main.py)
+data_finetune.csv
+model_patience_*.pt
+model_patience_*.csv
+test_metrics.csv
+*.png
