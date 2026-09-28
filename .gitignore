@@ -223,3 +223,5 @@ model_patience_*.pt
 model_patience_*.csv
 test_metrics.csv
 *.png
+bert_finetuned_*.pt
+test_predictions.csv
