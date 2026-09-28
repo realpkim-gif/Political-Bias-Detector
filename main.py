@@ -15,11 +15,8 @@ device="cuda" if torch.cuda.is_available() else "cpu"
 print(device)
 
 tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-large-uncased")
-model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
-model.eval() #turn off dropout layers to make stable
-
-for param in model.parameters(): #no backprop
-    param.requires_grad = False
+bert_model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
+# full fine-tune: every BERT parameter is trainable (requires_grad=True by default)
 
 def load_allsides_data():
     # This dataset's files have mixed encodings (mostly utf-8, some cp1252),
@@ -95,10 +92,11 @@ class TextLabelDataset(torch.utils.data.Dataset):
 
 def get_embedding(text, device): #(using BERT)
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True).to(device)
-    with torch.no_grad():
-        outputs = model(**inputs) #** unpacks input/attention mask dictionary into two lists.
+    outputs = bert_model(**inputs) #** unpacks input/attention mask dictionary into two lists.
+    # no blanket no_grad here: the last few BERT layers are unfrozen and need
+    # gradients during training. Callers wrap this in torch.no_grad() for eval.
 
-    return outputs.last_hidden_state.mean(dim=1)  # (batch, 1024) tensor, stays on device
+    return outputs.pooler_output  # (batch, 1024) — BERT's own [CLS]-based summary of the sequence
 
 class SimpleNeuralNet(nn.Module):
     def __init__(self, input_size, hidden_size, num_classes): #initiallize
@@ -119,8 +117,15 @@ class SimpleNeuralNet(nn.Module):
 # BERT-large embeddings are 1024-dim; 3 classes: LEFT, CENTER, RIGHT (from get_embeddings)
 final_model = SimpleNeuralNet(input_size=1024, hidden_size=256, num_classes=3).to(device)
 
-loss_function = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(final_model.parameters())  # only the classifier head is trainable; BERT is frozen
+# inverse-frequency class weights so the loss doesn't ignore CENTER (the minority class)
+class_counts = y_train.value_counts().sort_index()
+class_weights = torch.tensor(
+    (len(y_train) / (3 * class_counts)).values, dtype=torch.float32, device=device
+)
+loss_function = nn.CrossEntropyLoss(weight=class_weights)
+
+trainable_bert_params = [p for p in bert_model.parameters() if p.requires_grad]
+optimizer = torch.optim.Adam(list(final_model.parameters()) + trainable_bert_params)
 
 train_loader = DataLoader(
     dataset=TextLabelDataset(X_train, y_train),
@@ -148,6 +153,7 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
 
     for epoch in range(num_epochs):
         model.train()
+        bert_model.train()  # unfrozen BERT layers need dropout active during training too
         running_loss = 0.0
         for batch_idx, (test_input, test_output) in enumerate(train_loader):
             output = model(test_input)
@@ -161,6 +167,7 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
 
         #evaluate with val
         model.eval()
+        bert_model.eval()
         with torch.no_grad():
             val_scores, val_labels = predict_in_batches(model, list(X_val), list(y_val))
             val_loss = loss_function(val_scores, val_labels.to(device)).item()
@@ -185,10 +192,12 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
 
 train(final_model, optimizer, loss_function, train_loader, 5, "model_patience_5")
 torch.save(final_model.state_dict(), 'model_patience_5.pt')
+torch.save(bert_model.state_dict(), 'bert_finetuned_patience_5.pt')  # unfrozen layers changed too
 
 
 #End of train and TEST model
 final_model.eval()                    # dropout off
+bert_model.eval()
 with torch.no_grad():          # no gradient tracking for specific (diff way than BERT but same thing, only in that block with this)
     #with is try and finally (to close) but simpler
     inputs = list(X_test)
@@ -212,4 +221,11 @@ with torch.no_grad():          # no gradient tracking for specific (diff way tha
         "f1": f1.item(),
     }])
     test_metrics.to_csv("test_metrics.csv", index=False)
+
+    # save per-example true/predicted labels for the confusion matrix
+    predictions = pd.DataFrame({
+        "true_label": y_test_true.cpu().numpy(),
+        "pred_label": pred.cpu().numpy(),
+    })
+    predictions.to_csv("test_predictions.csv", index=False)
 

@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 import numpy as np
+from sklearn.metrics import confusion_matrix
 
 sns.set_theme(style="whitegrid")
 
@@ -76,6 +77,28 @@ def plot_bias_variance(save_path="bias_variance_tradeoff.png"):
 
 
 
+def plot_confusion_matrix(csv_path="test_predictions.csv", save_path="confusion_matrix.png"):
+    predictions = pd.read_csv(csv_path)
+    labels = ["LEFT", "CENTER", "RIGHT"]
+
+    cm = confusion_matrix(predictions["true_label"], predictions["pred_label"], labels=[0, 1, 2])
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    sns.heatmap(
+        cm, annot=True, fmt="d", cmap="Blues",
+        xticklabels=labels, yticklabels=labels,
+        cbar=True, ax=ax,
+    )
+
+    ax.set_title("Confusion Matrix (Test Set)")
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+
+
 if __name__ == "__main__":
     plot_training_history()
     plot_bias_variance()
+    plot_confusion_matrix()
