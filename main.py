@@ -159,9 +159,7 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
     epochs_without_improvement = 0
     history = {"epoch": [], "loss": [], "val_loss": []}
 
-    # mixed precision: runs BERT in fp16 to roughly halve memory use and speed up
-    # compute on GPUs with Tensor Cores (like yours). GradScaler prevents small
-    # gradients from underflowing to zero in fp16.
+    # AMP = autocast (forward pass, picks fp16/fp32 per-op, used in both train and eval) + GradScaler (backward pass only, pure multiply/divide, no dtype casting)
     scaler = torch.amp.GradScaler("cuda")
 
     for epoch in range(num_epochs):
@@ -182,9 +180,8 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
                 loss = loss_function(output, test_output.to(device))
 
             running_loss += loss.item()
-            #quicker training:
-            scaler.scale(loss).backward()  # scale loss up so small gradients don't underflow to zero in fp16
-            scaler.step(optimizer)  # unscale gradients back down, then optimizer.step() with correct-sized fp32 update
+            scaler.scale(loss).backward()  # multiply loss up (no dtype change) before backward() so small gradients don't underflow to zero
+            scaler.step(optimizer)  # divide gradients back down (no dtype change), then optimizer.step() with correct-sized update
             scaler.update()  # lower on detected overflow (real evidence); raise after stable streak (blind guess, underflow is never directly detectable)
 
             if batch_idx % 50 == 0:

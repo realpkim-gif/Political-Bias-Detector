@@ -2,11 +2,35 @@
 
 Notes on `torch.amp.autocast` and `torch.amp.GradScaler`, and why they're used in `main.py`'s `train()` function.
 
+## TL;DR (Too Long; Didn't Read)
+
+- **`autocast`** — fp16 rounding on forward-pass math is small enough that it doesn't meaningfully hurt training. Not worth thinking about further.
+- **`GradScaler`** — exists because gradients specifically can shrink to zero during backprop, which would actually break training if left unhandled. That's the one real thing to remember.
+
+Everything below is the "why" behind that, kept for reference — not something to re-derive day to day.
+
 ## Why we added this
 
 Full fine-tuning of BERT-large (all ~340M parameters trainable, not just a small classifier head) needs to store activations across all 24 layers for every example in a batch, in order to compute gradients during `backward()`. This uses a lot of GPU memory — enough that even `batch_size=4` was running the GPU at ~97% memory capacity (7930MiB / 8188MiB), causing the training process to run extremely slowly (30+ hours without finishing even one confirmed epoch), likely due to memory fragmentation/thrashing near the memory ceiling.
 
 Mixed precision training runs the expensive matrix math in fp16 (16-bit floats) instead of fp32 (32-bit floats), roughly halving memory use for those operations and often speeding up compute on GPUs with Tensor Cores (which the RTX 4060 has).
+
+## AMP vs. autocast — these aren't two alternatives, one contains the other
+
+"AMP" (Automatic Mixed Precision) is the name for the overall technique. `autocast` and `GradScaler` are the two tools PyTorch gives you to actually implement it, and they handle two different halves of one training step:
+
+- **`autocast`** — handles the **forward pass**. It's the piece that actually decides, per-operation, whether to run in fp16 or fp32, and does the dtype casting.
+- **`GradScaler`** — handles the **backward pass**. It does *not* do any dtype casting itself — it just scales the numeric size of the loss/gradients (multiplies, then later divides back down) so that fp16's small representable range doesn't cause gradients to underflow to zero during `backward()`.
+
+So: `AMP = autocast (forward pass precision) + GradScaler (backward pass safety)`. You need both for training; `predict_in_batches` only uses `autocast`, since there's no `backward()` call during evaluation.
+
+## Common mix-ups, corrected
+
+- **"autocast is only used for prediction/eval"** — no. `autocast` wraps the forward pass in *both* training and eval. In `train()`, it wraps the exact same `output = model(...)`/loss computation that happens during training, not just in `predict_in_batches`.
+- **"autocast and GradScaler both scale things"** — no. Only `GradScaler` scales (multiplies/divides numeric values). `autocast` never multiplies anything — it only chooses a *dtype* per operation. Calling both "scales" is a category error; they solve different problems with different mechanisms.
+- **"GradScaler casts gradients to a different bit-width"** — no. `GradScaler` never changes any tensor's dtype. It only multiplies the loss up before `backward()` and divides the gradients back down before `optimizer.step()` — pure arithmetic, same dtype throughout. Casting between fp16/fp32 is entirely `autocast`'s job, not `GradScaler`'s.
+- **"Sigmoid/softmax are examples of ops that need fp16 casting"** — backwards. Autocast deliberately keeps ops like `sigmoid`, `softmax`, and loss functions in fp32, because they're numerically sensitive. The ops that *do* get cast to fp16 are the expensive, numerically-tolerant ones — matrix multiplications (`Linear`, `matmul`, convolutions).
+- **"The scale-up in GradScaler is for the optimizer/learning rate"** — not quite. The scale-**up** (`scaler.scale(loss)`) happens *before* `backward()`, purely to protect the gradient computation itself from underflowing. The scale-**down** (`scaler.step()`'s internal unscale) happens *after* `backward()`, right before `optimizer.step()` — that's the part that ensures the optimizer applies a correctly-sized update with the real learning rate.
 
 ## What stays fp32 vs what becomes fp16
 
@@ -100,6 +124,27 @@ scaler.update()
 2. **`scaler.scale(loss).backward()`** — scale the loss up, then backpropagate (computes scaled gradients).
 3. **`scaler.step(optimizer)`** — unscale the gradients back to their true size, then update the fp32 weights.
 4. **`scaler.update()`** — adjust the scale factor based on whether this step was numerically stable.
+
+## Why ordinary fp16 rounding (in autocast) doesn't get a scaling fix, but underflow (in GradScaler) does
+
+fp16 loses precision two different ways, and only one of them can be fixed by scaling:
+
+- **Ordinary rounding error** — fp16 only stores ~3 decimal digits of precision (10 mantissa bits vs. fp32's 23). Every value computed in fp16 gets rounded to the nearest representable fp16 number. This error is *relative* — roughly the same tiny percentage off, whether the true value is `2.3` or `230,000`.
+- **Underflow** — a value smaller than fp16's minimum (~`0.00006`) doesn't just round imprecisely, it collapses to exactly `0.0`. That's a total, absolute loss of the value, not a small percentage error.
+
+**Scaling can fix underflow, but literally cannot fix ordinary rounding — here's the arithmetic showing why:**
+
+Say a value's true magnitude is `x`, and fp16 rounding introduces a relative error of about 0.05%, so the value you actually get is `x × 1.0005` instead of `x`.
+
+Now multiply by a scale factor `S` before the operation, and divide by the same `S` after:
+```
+rounded(x × S) / S  ≈  (x × S × 1.0005) / S  =  x × 1.0005
+```
+The `S` cancels out completely — you're left with the exact same 0.0005 (0.05%) relative error you started with. Scaling a value up and back down doesn't change *how many correct digits* fp16 can store; it just shifts where those digits sit numerically. The relative error rides along unchanged either way.
+
+**Underflow is different because it isn't a "percentage" error at all — it's a cliff.** A value like `0.0000001` doesn't round to "a slightly wrong small number," it rounds to `0.0`, a complete loss of information. Scaling *does* help here: multiply `0.0000001` by `1024` first, and you get `0.0001024` — now comfortably above fp16's `~0.00006` floor, so it survives as a real (if still slightly imprecise) number instead of vanishing. Divide back down afterward, and you recover something close to the original value — instead of recovering nothing at all.
+
+**So the reason `autocast` has no scaling mechanism isn't an oversight** — scaling literally cannot reduce relative rounding error (the math cancels out, as shown above). It only rescues values from the underflow cliff. Since ordinary forward-pass activations (kept in a stable range by things like `LayerNorm`) rarely approach that cliff, while gradients — shrunk by repeated chain-rule multiplication across 24 layers — regularly do, scaling is specifically useful for `GradScaler`'s job and simply irrelevant to `autocast`'s.
 
 ## Where GradScaler is NOT needed
 
