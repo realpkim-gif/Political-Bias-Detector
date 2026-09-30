@@ -97,6 +97,11 @@ def get_embedding(text, device): #(using BERT)
     # gradients during training. Callers wrap this in torch.no_grad() for eval.
 
     return outputs.pooler_output  # (batch, 1024) — BERT's own [CLS]-based summary of the sequence
+    #pooler_output = tanh(Linear(last_hidden_state[:, 0, :]))
+"""
+This is exactly the setup BERT's original paper and GLUE benchmark used, 
+and it's what HuggingFace's own BertForSequenceClassification does by default for classification fine-tuning.
+"""
 
 class SimpleNeuralNet(nn.Module):
     def __init__(self, input_size, hidden_size, num_classes): #initiallize
@@ -127,19 +132,22 @@ loss_function = nn.CrossEntropyLoss(weight=class_weights)
 trainable_bert_params = [p for p in bert_model.parameters() if p.requires_grad]
 optimizer = torch.optim.Adam(list(final_model.parameters()) + trainable_bert_params)
 
-train_loader = DataLoader(
+loader = DataLoader(
     dataset=TextLabelDataset(X_train, y_train),
-    batch_size=64,
+    batch_size=4,
     shuffle=True
 )
 
 def predict_in_batches(model, texts, labels):
-    loader = DataLoader(TextLabelDataset(texts, labels), batch_size=64, shuffle=False)
+    train_loader = DataLoader(TextLabelDataset(texts, labels), batch_size=4, shuffle=False)
     all_scores = []
     all_labels = []
-    for batch_texts, batch_labels in loader:
-        all_scores.append(model(batch_texts))
-        all_labels.append(batch_labels)
+    # same fp16 speed/memory benefit as training; no GradScaler needed here
+    # since there's no backward() pass during evaluation
+    with torch.amp.autocast("cuda"):
+        for batch_texts, batch_labels in train_loader:
+            all_scores.append(model(batch_texts))
+            all_labels.append(batch_labels)
     return torch.cat(all_scores, dim=0), torch.cat(all_labels, dim=0)
 
 
@@ -151,19 +159,38 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
     epochs_without_improvement = 0
     history = {"epoch": [], "loss": [], "val_loss": []}
 
+    # mixed precision: runs BERT in fp16 to roughly halve memory use and speed up
+    # compute on GPUs with Tensor Cores (like yours). GradScaler prevents small
+    # gradients from underflowing to zero in fp16.
+    scaler = torch.amp.GradScaler("cuda")
+
     for epoch in range(num_epochs):
         model.train()
         bert_model.train()  # unfrozen BERT layers need dropout active during training too
         running_loss = 0.0
+        num_batches = len(train_loader)
         for batch_idx, (test_input, test_output) in enumerate(train_loader):
-            output = model(test_input)
-            loss = loss_function(output, test_output.to(device))
-            running_loss += loss.item()
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
 
-        avg_train_loss = running_loss / len(train_loader)
+            # autocast: runs the ops inside this block in fp16 where safe (matmuls,
+            # the big BERT computations), while keeping precision-sensitive ops
+            # (like the loss) in fp32 automatically. Weights themselves stay fp32 —
+            # only certain safe operations get a temporary fp16 copy of their inputs.
+            # Dangerous opperations like sigmoid keep/upscale to fp32 and output fp32
+            with torch.amp.autocast("cuda"):
+                output = model(test_input)
+                loss = loss_function(output, test_output.to(device))
+
+            running_loss += loss.item()
+            #quicker training:
+            scaler.scale(loss).backward()  # scale loss up so small gradients don't underflow to zero in fp16
+            scaler.step(optimizer)  # unscale gradients back down, then optimizer.step() with correct-sized fp32 update
+            scaler.update()  # lower on detected overflow (real evidence); raise after stable streak (blind guess, underflow is never directly detectable)
+
+            if batch_idx % 50 == 0:
+                print(f"  epoch {epoch + 1} batch {batch_idx}/{num_batches} loss={loss.item():.4f}")
+
+        avg_train_loss = running_loss / num_batches
 
         #evaluate with val
         model.eval()
@@ -175,6 +202,8 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
         history["epoch"].append(epoch + 1)
         history["loss"].append(avg_train_loss)
         history["val_loss"].append(val_loss)
+
+        print(f"--- Epoch {epoch + 1}: train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f} ---")
 
         #early stop
         if val_loss < best_val_loss:
@@ -190,7 +219,7 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
     hist_data.to_csv(f"{train_name}.csv", index=False)
 
 
-train(final_model, optimizer, loss_function, train_loader, 5, "model_patience_5")
+train(final_model, optimizer, loss_function, loader, 5, "model_patience_5")
 torch.save(final_model.state_dict(), 'model_patience_5.pt')
 torch.save(bert_model.state_dict(), 'bert_finetuned_patience_5.pt')  # unfrozen layers changed too
 
