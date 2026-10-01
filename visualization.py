@@ -46,35 +46,40 @@ def plot_training_history(csv_path="model_patience_5.csv", save_path="training_h
     fig.savefig(save_path, dpi=150)
 
 
-def plot_bias_variance(save_path="bias_variance_tradeoff.png"):
-    complexity = np.linspace(0.1, 10, 500)
 
-    bias = 10 / (complexity + 1)            # high at low complexity, drops as complexity rises
-    variance = 0.15 * complexity ** 1.8      # low at low complexity, rises as complexity rises
+def plot_bias_variance(csv_path="model_patience_5.csv", save_path="bias_variance_real.png"):
+    # Uses actual training history: train_loss as a stand-in for "bias" (how well
+    # the model fits what it's seeing) and val_loss as a stand-in for "variance"
+    # (how well that generalizes) — not a rigorous bias/variance decomposition,
+    # just the same red/blue/sweet-spot framing applied to your real numbers.
+    history = pd.read_csv(csv_path)
 
-    # sweet spot = where the two curves cross
+    epoch = history["epoch"].values
+    bias = history["loss"].values
+    variance = history["val_loss"].values
+
+    # sweet spot = where the two curves cross; if they never cross, use closest approach
     diff = bias - variance
     sign_changes = np.where(np.diff(np.sign(diff)))[0]
     cross_idx = sign_changes[0] if len(sign_changes) else np.argmin(np.abs(diff))
-    sweet_x, sweet_y = complexity[cross_idx], bias[cross_idx]
+    sweet_x, sweet_y = epoch[cross_idx], bias[cross_idx]
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(complexity, bias, color="red", linewidth=2, label="Bias")
-    ax.plot(complexity, variance, color="blue", linewidth=2, label="Variance")
+    ax.plot(epoch, bias, color="red", linewidth=2, marker="o", label="Bias (train loss)")
+    ax.plot(epoch, variance, color="blue", linewidth=2, marker="o", label="Variance (val loss)")
     ax.scatter(
         [sweet_x], [sweet_y],
         marker="*", s=500, color="gold", edgecolor="black", linewidth=1,
         zorder=5, label="Sweet spot",
     )
 
-    ax.set_title("Bias-Variance Tradeoff")
-    ax.set_xlabel("Model Complexity")
-    ax.set_ylabel("Error")
+    ax.set_title("Bias-Variance Tradeoff (Real Training Data)")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
     ax.legend()
 
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
-
 
 
 def plot_confusion_matrix(csv_path="test_predictions.csv", save_path="confusion_matrix.png"):
