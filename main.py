@@ -165,7 +165,9 @@ def predict_in_batches(model, texts, labels):
     all_scores = []
     all_labels = []
     # bf16: same speed/memory benefit as fp16, but no GradScaler needed at all
-    # (bf16 has fp32's range, so there's no overflow/underflow to guard against)
+    # (bf16 has fp32's range, so there's no overflow/underflow to guard against).
+    # autocast only casts "safe" ops (matmuls) to bf16; unsafe ops stay at their
+    # original dtype or get upcast to at least fp32 — never cast down.
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         for batch_texts, batch_labels in train_loader:
             all_scores.append(model(batch_texts))
@@ -200,10 +202,10 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
         for batch_idx, (test_input, test_output) in enumerate(train_loader):
             optimizer.zero_grad()
 
-            # autocast: runs the ops inside this block in bf16 where safe (matmuls,
-            # the big BERT computations), while keeping precision-sensitive ops
-            # (like the loss) in fp32 automatically. Weights themselves stay fp32 —
-            # only certain safe operations get a temporary bf16 copy of their inputs.
+            # autocast only casts to bf16 for ops on its "safe" list (matmuls, the big
+            # BERT computations). Unsafe ops either stay at whatever dtype they already
+            # were, or get upcast to at least fp32 (e.g. the loss) — never cast down.
+            # Weights themselves stay fp32 regardless; only op inputs get a temp bf16 copy.
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 output = model(test_input)
                 loss = loss_function(output, test_output.to(device))
@@ -220,6 +222,9 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
             # the scheduler's accuracy-plateau reductions aren't fought/overwritten.
             global_step += 1
             if global_step <= warmup_steps:
+                # global_step/warmup_steps is the fraction of warmup completed so far,
+                # not a coincidence: at global_step == warmup_steps the fraction is
+                # exactly 1, so lr lands exactly on base_lr — never over or under.
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = base_lr * global_step / warmup_steps
 
