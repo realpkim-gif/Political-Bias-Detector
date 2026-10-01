@@ -1,13 +1,27 @@
 # Mixed Precision Training (AMP) Notes
 
-Notes on `torch.amp.autocast` and `torch.amp.GradScaler`, and why they're used in `main.py`'s `train()` function.
+Notes on `torch.amp.autocast`, `torch.amp.GradScaler`, and why we switched from fp16 to bf16, in `main.py`'s `train()` function.
+
+## Update: switched from fp16 to bf16 — GradScaler is gone
+
+After multiple training runs (over several days) where the loss stayed completely flat at `~1.0986` (exactly `ln(3)`, i.e. "the model knows nothing") despite fixing the learning rate and an early-stopping bug, we added a diagnostic to check whether `GradScaler` was silently skipping optimizer steps due to fp16 overflow. Rather than keep chasing fp16-specific instability, we switched to **bf16**, which removes the entire class of problem:
+
+- **What bf16 is**: "Brain Float 16" — a different 16-bit floating point format than fp16 (`float16`). Both use 16 bits total, but they split those bits differently:
+  - **fp16**: 5 exponent bits, 10 mantissa bits → small range, more precision within that range.
+  - **bf16**: 8 exponent bits (same as fp32!), 7 mantissa bits → fp32's full range, less precision than fp16.
+- **Why that matters here**: fp16's narrow range is exactly what caused the underflow/overflow problem `GradScaler` existed to manage — tiny gradients underflowing to `0.0`, or oversized ones overflowing to `inf`/`NaN`. bf16 shares fp32's range (just with coarser precision), so values that would have overflowed or underflowed in fp16 simply don't hit those limits in bf16 — no scaling trick needed to dodge a cliff that no longer exists.
+- **The tradeoff**: bf16 has fewer mantissa bits than fp16 (7 vs. 10), so it's *less precise* within its range. For this task that's an acceptable tradeoff — the whole point of `autocast` was already "accept mild rounding error on matmuls," and bf16's extra rounding is in the same spirit, just with no cliff-edge failure mode to worry about.
+- **What this means for the code**: `GradScaler` is no longer needed anywhere, since there's no overflow/underflow to scale around. `torch.amp.autocast("cuda", dtype=torch.bfloat16)` replaces `torch.amp.autocast("cuda")`, and the training loop goes back to plain `loss.backward()` / `optimizer.step()` — no `scaler.scale()`/`scaler.step()`/`scaler.update()` dance.
+- Confirmed working on this GPU: `torch.cuda.is_bf16_supported()` returns `True` on the RTX 4060 (Ada Lovelace architecture has native bf16 Tensor Core support).
+
+Everything below this point describes the fp16 + `GradScaler` approach we started with — kept for reference/history, since the reasoning (what autocast does, why scaling fixes underflow but not rounding, etc.) is still accurate background even though the code no longer uses `GradScaler`.
 
 ## TL;DR (Too Long; Didn't Read)
 
-- **`autocast`** — fp16 rounding on forward-pass math is small enough that it doesn't meaningfully hurt training. Not worth thinking about further.
-- **`GradScaler`** — exists because gradients specifically can shrink to zero during backprop, which would actually break training if left unhandled. That's the one real thing to remember.
+- **`autocast`** — picks fp16/bf16 vs fp32 per-operation during the forward pass. Rounding error from this is small enough not to meaningfully hurt training.
+- **`GradScaler`** (fp16 only, no longer used) — existed because fp16 gradients specifically could shrink to zero during backprop. Not needed with bf16, since bf16 doesn't have that narrow-range problem in the first place.
 
-Everything below is the "why" behind that, kept for reference — not something to re-derive day to day.
+Everything below is the "why" behind the fp16/GradScaler approach, kept for reference — not something to re-derive day to day.
 
 ## Why we added this
 
