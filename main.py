@@ -143,7 +143,10 @@ loader = DataLoader(
 )
 
 # linear warmup over a fixed 1 epoch's worth of steps (ramps 0 -> base_lr), applied
-# manually per-batch in train(). Fixed to len(loader) rather than a % of num_epochs
+# manually per-batch in train(). This is purely a stability measure — protects
+# BERT's pretrained weights from large, destructive early updates — not a lever
+# for better accuracy. Once past that risk window, a longer warmup adds no benefit.
+# Fixed to len(loader) rather than a % of num_epochs
 # so it doesn't balloon just because num_epochs is set high for early-stopping
 # headroom — num_epochs is a safety ceiling, not a real training-length estimate.
 # After warmup, LR holds at base_lr until validation accuracy fails to improve —
@@ -176,6 +179,44 @@ def predict_in_batches(model, texts, labels):
     # class_weights tensor is fp32, and this is called outside any autocast block
     # (no automatic reconciliation) — without this, dtype mismatch crashes cross_entropy
     return torch.cat(all_scores, dim=0).float(), torch.cat(all_labels, dim=0)
+
+
+# Both of these control lr, grouped together for readability, but run at different
+# granularities: warmup is called per-batch (needs global_step, which only
+# increments inside the batch loop); decay is called per-epoch (needs val_accuracy,
+# which only exists once validation has run over the whole val set for that epoch).
+
+def apply_warmup(optimizer, global_step, warmup_steps, base_lr):
+    # linear warmup: ramp lr from 0 -> base_lr over the first warmup_steps
+    # batches. Once warmup finishes, this stops touching lr entirely, so
+    # the decay logic's accuracy-plateau reductions aren't fought/overwritten.
+    if global_step <= warmup_steps:
+        print(f"[WARMUP] step {global_step}/{warmup_steps}")
+        # global_step/warmup_steps is the fraction of warmup completed so far,
+        # not a coincidence: at global_step == warmup_steps the fraction is
+        # exactly 1, so lr lands exactly on base_lr — never over or under.
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = base_lr * global_step / warmup_steps
+            #when global_step = warmup then base_lr is achieved (at last batch) then decay phase
+
+
+def apply_accuracy_decay(optimizer, val_accuracy, best_val_accuracy, epochs_without_lr_improvement, has_decayed_once, lr_patience):
+    # two-stage lr decay: patience=1 for the first decay (react fast), patience=3
+    # for every decay after that (don't keep halving every single epoch)
+    if val_accuracy > best_val_accuracy:
+        best_val_accuracy = val_accuracy
+        epochs_without_lr_improvement = 0
+    else:
+        epochs_without_lr_improvement += 1
+        if epochs_without_lr_improvement >= lr_patience:
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = max(param_group["lr"] * LR_DECAY_FACTOR, MIN_LR)
+            epochs_without_lr_improvement = 0
+            if not has_decayed_once:
+                has_decayed_once = True
+                lr_patience = 3  # loosen up after the first reaction
+    return best_val_accuracy, epochs_without_lr_improvement, has_decayed_once, lr_patience
+
 
 #applying optimization
 def train(model, optimizer, loss_function, train_loader, patience, train_name):
@@ -216,16 +257,12 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
             torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]["params"], max_norm=1.0)  # cap extreme gradients before they hit the optimizer
             optimizer.step()
 
-            # linear warmup: ramp lr from 0 -> base_lr over the first warmup_steps
-            # batches. Once warmup finishes, this stops touching lr entirely, so
-            # the scheduler's accuracy-plateau reductions aren't fought/overwritten.
-            global_step += 1
+            # stop incrementing once past warmup_steps — nothing downstream reads the
+            # exact value, only whether it's <= or > warmup_steps, and that comparison
+            # result is already locked in permanently once it crosses the threshold once
             if global_step <= warmup_steps:
-                # global_step/warmup_steps is the fraction of warmup completed so far,
-                # not a coincidence: at global_step == warmup_steps the fraction is
-                # exactly 1, so lr lands exactly on base_lr — never over or under.
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = base_lr * global_step / warmup_steps
+                global_step += 1
+            apply_warmup(optimizer, global_step, warmup_steps, base_lr)
 
             print(f"  epoch {epoch + 1} batch {batch_idx}/{num_batches} loss={loss.item():.4f}")
 
@@ -248,18 +285,10 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
         # the ramp above, so a reduction here would just get overwritten by the
         # next batch's warmup step anyway
         if global_step > warmup_steps:
-            if val_accuracy > best_val_accuracy:
-                best_val_accuracy = val_accuracy
-                epochs_without_lr_improvement = 0
-            else:
-                epochs_without_lr_improvement += 1
-                if epochs_without_lr_improvement >= lr_patience:
-                    for param_group in optimizer.param_groups:
-                        param_group["lr"] = max(param_group["lr"] * LR_DECAY_FACTOR, MIN_LR)
-                    epochs_without_lr_improvement = 0
-                    if not has_decayed_once:
-                        has_decayed_once = True
-                        lr_patience = 3  # loosen up after the first reaction
+            print(f"[DECAY] epoch {epoch + 1}: val_accuracy={val_accuracy:.4f} best={best_val_accuracy:.4f} patience={lr_patience}")
+            best_val_accuracy, epochs_without_lr_improvement, has_decayed_once, lr_patience = apply_accuracy_decay(
+                optimizer, val_accuracy, best_val_accuracy, epochs_without_lr_improvement, has_decayed_once, lr_patience
+            )
 
         print(f"--- Epoch {epoch + 1}: train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f} lr={optimizer.param_groups[0]['lr']:.2e} ---")
 
