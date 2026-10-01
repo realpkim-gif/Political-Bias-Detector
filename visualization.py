@@ -47,7 +47,7 @@ def plot_training_history(csv_path="model_patience_5.csv", save_path="training_h
 
 
 
-def plot_bias_variance(csv_path="model_patience_5.csv", save_path="bias_variance_real.png"):
+def plot_bias_variance(csv_path="model_patience_5.csv", save_path="bias_variance.png"):
     # Uses actual training history: train_loss as a stand-in for "bias" (how well
     # the model fits what it's seeing) and val_loss as a stand-in for "variance"
     # (how well that generalizes) — not a rigorous bias/variance decomposition,
@@ -73,7 +73,7 @@ def plot_bias_variance(csv_path="model_patience_5.csv", save_path="bias_variance
         zorder=5, label="Sweet spot",
     )
 
-    ax.set_title("Bias-Variance Tradeoff (Real Training Data)")
+    ax.set_title("Bias-Variance Tradeoff")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
     ax.legend()
