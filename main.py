@@ -177,7 +177,6 @@ def predict_in_batches(model, texts, labels):
     # (no automatic reconciliation) — without this, dtype mismatch crashes cross_entropy
     return torch.cat(all_scores, dim=0).float(), torch.cat(all_labels, dim=0)
 
-
 #applying optimization
 def train(model, optimizer, loss_function, train_loader, patience, train_name):
     best_val_loss = float("inf")
