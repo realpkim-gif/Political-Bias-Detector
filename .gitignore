@@ -225,3 +225,13 @@ test_metrics.csv
 *.png
 bert_finetuned_*.pt
 test_predictions.csv
+
+# Outputs of head_only.py / head_only_Lora_Top2.py / head_only_Lora_AllLayers.py / Bert_Full_Small.py
+head_only*.pt
+head_only*.csv
+Lora_Models/
+Bert_Full_Weight_Fine_Tune/
+bert_small_full*.pt
+bert_small_full.csv
+test_metrics_*.csv
+test_predictions_*.csv

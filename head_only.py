@@ -1,4 +1,3 @@
-import os
 from transformers import AutoTokenizer, AutoModel
 from huggingface_hub import hf_hub_download
 import zipfile
@@ -14,8 +13,11 @@ device="cuda" if torch.cuda.is_available() else "cpu"
 print(device)
 
 tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-large-uncased")
-bert_model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
-# full fine-tune: every BERT parameter is trainable (requires_grad=True by default)
+model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
+model.eval() #turn off dropout layers to make stable
+
+for param in model.parameters(): #no backprop
+    param.requires_grad = False
 
 def load_allsides_data():
     # This dataset's files have mixed encodings (mostly utf-8, some cp1252),
@@ -91,14 +93,24 @@ class TextLabelDataset(torch.utils.data.Dataset):
 
 def get_embedding(text, device): #(using BERT)
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True).to(device)
-    outputs = bert_model(**inputs) #** unpacks input/attention mask dictionary into two lists.
-    # no blanket no_grad here: this is a full fine-tune, so all of BERT needs
-    # gradients during training. Callers wrap this in torch.no_grad() for eval.
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):  # BERT forward in bf16
+        outputs = model(**inputs) #** unpacks input/attention mask dictionary into two lists.
 
-    return outputs.pooler_output  # (batch, 1024) — BERT's own [CLS]-based summary of the sequence
-    #pooler_output = tanh(Linear(last_hidden_state[:, 0, :]))
-    # This is the same setup BERT's original paper and GLUE benchmark used, and
-    # what HuggingFace's BertForSequenceClassification does by default.
+    # Pooler output (BERT's own pooling layer, applied to the [CLS] token):
+    #
+    #   [Linear Layer]
+    #          │
+    #          ▼
+    #   [Tanh / Sigmoid Activation]
+    #          │
+    #          ▼
+    #   [Pooler Output]  ──> (Ready for your custom Linear + Sigmoid/Softmax)
+    #
+    # (BERT's pooler uses Tanh.) pooler_output = tanh(Linear(last_hidden_state[:, 0, :]))
+    # Same setup BERT's original paper and GLUE used, and what HuggingFace's
+    # BertForSequenceClassification does by default. BERT is frozen here, so the pooler is too.
+    # back to fp32: the pooler runs in bf16 under autocast, and the fp32 head needs fp32 input
+    return outputs.pooler_output.float()  # (batch, 1024) tensor, stays on device
 
 class SimpleNeuralNet(nn.Module):
     def __init__(self, input_size, hidden_size, num_classes): #initiallize
@@ -129,13 +141,9 @@ class_weights = torch.tensor(
 )
 loss_function = nn.CrossEntropyLoss(weight=class_weights)
 
-trainable_bert_params = [p for p in bert_model.parameters() if p.requires_grad]
-# lr=2e-5: Adam's default (1e-3) is ~50x too large for fine-tuning a pretrained
-# transformer — it wrecked BERT's pretrained weights and collapsed the model
-# into always predicting the majority class within the first epoch
-# AdamW vs Adam: decouples weight decay from the gradient update instead of blending them together — standard practice for larger models like BERT
-base_lr = 2e-5
-optimizer = torch.optim.AdamW(list(final_model.parameters()) + trainable_bert_params, lr=base_lr)
+base_lr = 2e-5  # same peak lr as main.py (this script originally used Adam's default 1e-3)
+# AdamW vs Adam: decouples weight decay from the gradient update instead of blending them together — same optimizer as main.py
+optimizer = torch.optim.AdamW(final_model.parameters(), lr=base_lr)  # only the classifier head is trainable; BERT is frozen
 
 loader = DataLoader(
     dataset=TextLabelDataset(X_train, y_train),
@@ -168,20 +176,15 @@ MIN_LR = 1e-7
 # floor would freeze the adapters.
 
 def predict_in_batches(model, texts, labels):
-    train_loader = DataLoader(TextLabelDataset(texts, labels), batch_size=4, shuffle=False)
+    loader = DataLoader(TextLabelDataset(texts, labels), batch_size=4, shuffle=False)
     all_scores = []
     all_labels = []
-    # bf16: same speed/memory benefit as fp16, but no GradScaler needed at all
-    # (bf16 has fp32's range, so there's no overflow/underflow to guard against).
-    # autocast only casts "safe" ops (matmuls) to bf16; unsafe ops stay at their
-    # original dtype or get upcast to at least fp32 — never cast down.
+    # bf16 autocast, same as main.py
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        for batch_texts, batch_labels in train_loader:
+        for batch_texts, batch_labels in loader:
             all_scores.append(model(batch_texts))
             all_labels.append(batch_labels)
-    # cast back to fp32: autocast returns bf16-dtype scores, but loss_function's
-    # class_weights tensor is fp32, and this is called outside any autocast block
-    # (no automatic reconciliation) — without this, dtype mismatch crashes cross_entropy
+    # cast back to fp32: this is called outside autocast, so the loss needs fp32 scores
     return torch.cat(all_scores, dim=0).float(), torch.cat(all_labels, dim=0)
 
 
@@ -222,12 +225,13 @@ def apply_accuracy_decay(optimizer, val_accuracy, best_val_accuracy, epochs_with
     return best_val_accuracy, epochs_without_lr_improvement, has_decayed_once, lr_patience
 
 
+#returns batch_idx, (test_input, test_output)
+
 #applying optimization
 def train(model, optimizer, loss_function, train_loader, patience, train_name):
     best_val_loss = float("inf")
     epochs_without_improvement = 0
     history = {"epoch": [], "loss": [], "val_loss": [], "val_accuracy": []}
-    os.makedirs(train_name, exist_ok=True)  # creates Bert_Full_Weight_Fine_Tune/<run name>/ (and the top folder if missing)
     global_step = 0  # counts batches across the whole run, for the warmup ramp below
 
     # two-stage lr decay: patience=1 for the first decay (react fast), patience=3
@@ -237,27 +241,17 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
     has_decayed_once = False
     lr_patience = 1
 
-    # bf16 instead of fp16: same speed/memory win, but bf16 has fp32's full exponent
-    # range, so there's no overflow/underflow risk and no GradScaler needed at all
     for epoch in range(num_epochs):
         model.train()
-        bert_model.train()  # unfrozen BERT layers need dropout active during training too
         running_loss = 0.0
         num_batches = len(train_loader)
         for batch_idx, (test_input, test_output) in enumerate(train_loader):
-            optimizer.zero_grad()
-
-            # autocast only casts to bf16 for ops on its "safe" list (matmuls, the big
-            # BERT computations). Unsafe ops either stay at whatever dtype they already
-            # were, or get upcast to at least fp32 (e.g. the loss) — never cast down.
-            # Weights themselves stay fp32 regardless; only op inputs get a temp bf16 copy.
+            # bf16 autocast over forward + loss, same as main.py (bf16 needs no GradScaler)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 output = model(test_input)
                 loss = loss_function(output, test_output.to(device))
-
             running_loss += loss.item()
-            # dtype here follows each op's original forward-pass dtype (bf16 for the autocast ops above), not this line's position outside the with block.
-            # So not the default fp since forward used bf.
+            optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]["params"], max_norm=1.0)  # cap extreme gradients before they hit the optimizer
             optimizer.step()
@@ -275,7 +269,6 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
 
         #evaluate with val
         model.eval()
-        bert_model.eval()
         with torch.no_grad():
             val_scores, val_labels = predict_in_batches(model, list(X_val), list(y_val))
             val_loss = loss_function(val_scores, val_labels.to(device)).item()
@@ -304,12 +297,9 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
         if val_loss <= best_val_loss:
             best_val_loss = val_loss
             epochs_without_improvement = 0
-            # save the best checkpoint as soon as we see it — training can keep
-            # running a long time after this (early stop is gated on lr reaching
-            # MIN_LR), and the model can overfit in the meantime. Without this,
-            # we'd only ever have access to whatever the LAST epoch looked like.
-            torch.save(model.state_dict(), os.path.join(train_name, "head.pt"))
-            torch.save(bert_model.state_dict(), os.path.join(train_name, "bert.pt"))
+            # save the best checkpoint as soon as we see it (same as main.py) — training can
+            # keep running long after this, and the head can overfit in the meantime
+            torch.save(model.state_dict(), f"{train_name}.pt")
         elif current_lr <= MIN_LR:
             epochs_without_improvement += 1 #apply decay with patience of 5 once reach min (special not related to the original function of
             # patience of 3 decay and dividing by 2.
@@ -319,25 +309,22 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
 
     # save training history once training is finished (not every epoch)
     hist_data = pd.DataFrame(history)
-    hist_data.to_csv(os.path.join(train_name, "history.csv"), index=False)
+    hist_data.to_csv(f"{train_name}.csv", index=False)
 
 
-train_name = os.path.join("Bert_Full_Weight_Fine_Tune", "bert_large")  # all outputs go in Bert_Full_Weight_Fine_Tune/bert_large/
+train_name = "head_only"  # was "model_patience_5" — renamed so this script can't overwrite main.py's saved outputs
 train(final_model, optimizer, loss_function, loader, 5, train_name)
-# checkpoints are saved inside train() as soon as a new best val_loss is seen —
-# nothing to save here, that would overwrite the best with the final epoch's state
+# best-val_loss checkpoint is saved inside train() — nothing to save here, that would
+# overwrite the best with the final epoch's state
 
-# reload the best-val_loss checkpoint before testing — without this, the test
-# block below would just evaluate whatever's left in memory (the LAST epoch),
-# not the best one that got saved to disk during training.
-final_model.load_state_dict(torch.load(os.path.join(train_name, "head.pt"), map_location=device))
-bert_model.load_state_dict(torch.load(os.path.join(train_name, "bert.pt"), map_location=device))
-print(f"Reloaded best checkpoint (by val_loss) from {train_name}/head.pt and {train_name}/bert.pt for testing")
+# reload the best-val_loss checkpoint before testing (same as main.py), otherwise the
+# test block would evaluate the LAST epoch left in memory
+final_model.load_state_dict(torch.load(f"{train_name}.pt", map_location=device))
+print(f"Reloaded best checkpoint (by val_loss) from {train_name}.pt for testing")
 
 
 #End of train and TEST model
 final_model.eval()                    # dropout off
-bert_model.eval()
 with torch.no_grad():          # no gradient tracking for specific (diff way than BERT but same thing, only in that block with this)
     #with is try and finally (to close) but simpler
     inputs = list(X_test)
@@ -360,12 +347,12 @@ with torch.no_grad():          # no gradient tracking for specific (diff way tha
         "recall": rec.item(),
         "f1": f1.item(),
     }])
-    test_metrics.to_csv(os.path.join(train_name, "test_metrics.csv"), index=False)
+    test_metrics.to_csv("test_metrics_head_only.csv", index=False)  # was test_metrics.csv — renamed to avoid overwriting main.py's results
 
     # save per-example true/predicted labels for the confusion matrix
     predictions = pd.DataFrame({
         "true_label": y_test_true.cpu().numpy(),
         "pred_label": pred.cpu().numpy(),
     })
-    predictions.to_csv(os.path.join(train_name, "test_predictions.csv"), index=False)
+    predictions.to_csv("test_predictions_head_only.csv", index=False)  # was test_predictions.csv — renamed to avoid overwriting main.py's results
 
