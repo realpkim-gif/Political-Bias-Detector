@@ -13,8 +13,9 @@ from torchmetrics.functional import accuracy, precision, recall, f1_score
 device="cuda" if torch.cuda.is_available() else "cpu"
 print(device)
 
-tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-large-uncased")
-bert_model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
+MODEL_NAME = "google/bert_uncased_L-4_H-512_A-8"  # Google's "BERT-Small": 4 layers, hidden 512, 28.8M params (was google-bert/bert-large-uncased)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+bert_model = AutoModel.from_pretrained(MODEL_NAME).to(device)
 # full fine-tune: every BERT parameter is trainable (requires_grad=True by default)
 
 def load_allsides_data():
@@ -119,8 +120,9 @@ class SimpleNeuralNet(nn.Module):
         return scores
 
 
-# BERT-large embeddings are 1024-dim; 3 classes: LEFT, CENTER, RIGHT (from get_embeddings)
-final_model = SimpleNeuralNet(input_size=1024, hidden_size=256, num_classes=3).to(device)
+# BERT-Small embeddings are 512-dim (large was 1024) — read from the model config instead of hardcoding;
+# 3 classes: LEFT, CENTER, RIGHT (from get_embeddings)
+final_model = SimpleNeuralNet(input_size=bert_model.config.hidden_size, hidden_size=256, num_classes=3).to(device)
 
 # inverse-frequency class weights so the loss doesn't ignore CENTER (the minority class)
 class_counts = y_train.value_counts().sort_index()
@@ -163,9 +165,6 @@ loader = DataLoader(
 warmup_steps = len(loader) * 1
 LR_DECAY_FACTOR = 0.5
 MIN_LR = 1e-7
-# Floor: main.py lets the lr fall to 0.5% of its peak (1e-7 vs 2e-5, ~8 halvings).
-# LoRA (head_only_Lora_Top2.py / head_only_Lora_AllLayers.py) stops at 10% of each group's peak instead, since a near-zero
-# floor would freeze the adapters.
 
 def predict_in_batches(model, texts, labels):
     train_loader = DataLoader(TextLabelDataset(texts, labels), batch_size=4, shuffle=False)
@@ -322,7 +321,7 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
     hist_data.to_csv(os.path.join(train_name, "history.csv"), index=False)
 
 
-train_name = os.path.join("Bert_Full_Weight_Fine_Tune", "bert_large")  # all outputs go in Bert_Full_Weight_Fine_Tune/bert_large/
+train_name = os.path.join("Bert_Full_Weight_Fine_Tune", "bert_small")  # all outputs go in Bert_Full_Weight_Fine_Tune/bert_small/ (own folder, can't overwrite main.py's)
 train(final_model, optimizer, loss_function, loader, 5, train_name)
 # checkpoints are saved inside train() as soon as a new best val_loss is seen —
 # nothing to save here, that would overwrite the best with the final epoch's state

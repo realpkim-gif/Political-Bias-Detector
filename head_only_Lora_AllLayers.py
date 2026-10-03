@@ -9,13 +9,37 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 from torchmetrics.functional import accuracy, precision, recall, f1_score
+from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
 
 device="cuda" if torch.cuda.is_available() else "cpu"
 print(device)
 
 tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-large-uncased")
 bert_model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
-# full fine-tune: every BERT parameter is trainable (requires_grad=True by default)
+
+# VARIANT ALL LAYERS: LoRA on ALL 24 encoder layers (the standard HF/PEFT setup). Compare with
+# head_only_Lora_Top2.py, which adapts only the top 2 layers.
+# (get_peft_model freezes every base weight, only the LoRA adapters + the DNN head train).
+# This is the one intended difference from main.py (full fine-tune).
+# Config follows current best-practice guidance:
+#  - target ALL linear matrices in those layers (attention q/k/v/output + the MLP's two
+#    dense layers) — attention-only LoRA underperforms ("LoRA Without Regret")
+#  - r=16, alpha=2*r (standard rule of thumb), small dropout since the earlier full
+#    fine-tune overfit hard
+#  - LoRA lr ~10x what full fine-tuning uses (see optimizer below)
+num_bert_layers = bert_model.config.num_hidden_layers
+NUM_LORA_LAYERS = num_bert_layers  # all 24 layers (Top2 variant uses 2)
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    bias="none",
+    target_modules=["query", "key", "value", "dense"],
+    layers_to_transform=list(range(num_bert_layers - NUM_LORA_LAYERS, num_bert_layers)),
+    layers_pattern="layer",
+)
+bert_model = get_peft_model(bert_model, lora_config)
+bert_model.print_trainable_parameters()
 
 def load_allsides_data():
     # This dataset's files have mixed encodings (mostly utf-8, some cp1252),
@@ -92,13 +116,25 @@ class TextLabelDataset(torch.utils.data.Dataset):
 def get_embedding(text, device): #(using BERT)
     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=True).to(device)
     outputs = bert_model(**inputs) #** unpacks input/attention mask dictionary into two lists.
-    # no blanket no_grad here: this is a full fine-tune, so all of BERT needs
-    # gradients during training. Callers wrap this in torch.no_grad() for eval.
+    # no blanket no_grad here: the LoRA layers need gradients during training.
+    # Callers wrap this in torch.no_grad() for eval.
 
+    # Pooler output (BERT's own pooling layer, applied to the [CLS] token):
+    #
+    #   [Linear Layer]
+    #          │
+    #          ▼
+    #   [Tanh / Sigmoid Activation]
+    #          │
+    #          ▼
+    #   [Pooler Output]  ──> (Ready for your custom Linear + Sigmoid/Softmax)
+    #
+    # (BERT's pooler uses Tanh.)
     return outputs.pooler_output  # (batch, 1024) — BERT's own [CLS]-based summary of the sequence
     #pooler_output = tanh(Linear(last_hidden_state[:, 0, :]))
     # This is the same setup BERT's original paper and GLUE benchmark used, and
     # what HuggingFace's BertForSequenceClassification does by default.
+    # The pooler itself is frozen here (LoRA only touches the encoder layers).
 
 class SimpleNeuralNet(nn.Module):
     def __init__(self, input_size, hidden_size, num_classes): #initiallize
@@ -129,13 +165,19 @@ class_weights = torch.tensor(
 )
 loss_function = nn.CrossEntropyLoss(weight=class_weights)
 
-trainable_bert_params = [p for p in bert_model.parameters() if p.requires_grad]
-# lr=2e-5: Adam's default (1e-3) is ~50x too large for fine-tuning a pretrained
-# transformer — it wrecked BERT's pretrained weights and collapsed the model
-# into always predicting the majority class within the first epoch
+lora_params = [p for p in bert_model.parameters() if p.requires_grad]  # only the LoRA A/B matrices are trainable in BERT
+# DNN head keeps the original lr of 1e-3 (it starts random and learns from scratch).
+# LoRA adapters get 2e-4 (10x the 2e-5 full fine-tuning uses, per the "LoRA Without Regret"
+# guidance): they start as a no-op (B=0) and are tiny, so they need larger steps than full
+# fine-tuning to have any effect.
 # AdamW vs Adam: decouples weight decay from the gradient update instead of blending them together — standard practice for larger models like BERT
-base_lr = 2e-5
-optimizer = torch.optim.AdamW(list(final_model.parameters()) + trainable_bert_params, lr=base_lr)
+base_lr = 1e-3
+lora_lr = 2e-4
+optimizer = torch.optim.AdamW([
+    {"params": list(final_model.parameters()), "lr": base_lr},
+    {"params": lora_params, "lr": lora_lr},
+])
+base_lrs = [base_lr, lora_lr]  # per-group peak lr, for the warmup ramp
 
 loader = DataLoader(
     dataset=TextLabelDataset(X_train, y_train),
@@ -162,10 +204,14 @@ loader = DataLoader(
 # it doesn't keep halving the lr every single epoch once it's already reacted once).
 warmup_steps = len(loader) * 1
 LR_DECAY_FACTOR = 0.5
-MIN_LR = 1e-7
-# Floor: main.py lets the lr fall to 0.5% of its peak (1e-7 vs 2e-5, ~8 halvings).
-# LoRA (head_only_Lora_Top2.py / head_only_Lora_AllLayers.py) stops at 10% of each group's peak instead, since a near-zero
-# floor would freeze the adapters.
+# Floors, per lr group (each decay halves both groups, never below that group's own floor):
+#   DNN head : 10% of its 1e-3 peak = 1e-4
+#   LoRA     : 10% of its 2e-4 peak = 2e-5
+# 10% of peak (the usual LoRA min_lr_ratio=0.1), NOT main.py's near-zero 1e-7: a floor that low
+# would freeze the adapters, and LoRA keeps learning usefully at a small lr.
+# Early stopping only counts once BOTH groups are at their floor (~4 halvings).
+MIN_LR_RATIO = 0.1
+min_lrs = [lr * MIN_LR_RATIO for lr in base_lrs]
 
 def predict_in_batches(model, texts, labels):
     train_loader = DataLoader(TextLabelDataset(texts, labels), batch_size=4, shuffle=False)
@@ -190,16 +236,16 @@ def predict_in_batches(model, texts, labels):
 # increments inside the batch loop); decay is called per-epoch (needs val_accuracy,
 # which only exists once validation has run over the whole val set for that epoch).
 
-def apply_warmup(optimizer, global_step, warmup_steps, base_lr):
-    # linear warmup: ramp lr from 0 -> base_lr over the first warmup_steps
-    # batches. Once warmup finishes, this stops touching lr entirely, so
+def apply_warmup(optimizer, global_step, warmup_steps, base_lrs):
+    # linear warmup: ramp each group's lr from 0 -> its own base lr (head, LoRA) over the
+    # first warmup_steps batches. Once warmup finishes, this stops touching lr entirely, so
     # the decay logic's accuracy-plateau reductions aren't fought/overwritten.
     if global_step <= warmup_steps:
         print(f"[WARMUP] step {global_step}/{warmup_steps}")
         # global_step/warmup_steps is the fraction of warmup completed so far,
         # not a coincidence: at global_step == warmup_steps the fraction is
         # exactly 1, so lr lands exactly on base_lr — never over or under.
-        for param_group in optimizer.param_groups:
+        for param_group, base_lr in zip(optimizer.param_groups, base_lrs):
             param_group["lr"] = base_lr * global_step / warmup_steps
             #when global_step = warmup then base_lr is achieved (at last batch) then decay phase
 
@@ -213,8 +259,8 @@ def apply_accuracy_decay(optimizer, val_accuracy, best_val_accuracy, epochs_with
     else:
         epochs_without_lr_improvement += 1
         if epochs_without_lr_improvement >= lr_patience:
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = max(param_group["lr"] * LR_DECAY_FACTOR, MIN_LR)
+            for param_group, min_lr in zip(optimizer.param_groups, min_lrs):
+                param_group["lr"] = max(param_group["lr"] * LR_DECAY_FACTOR, min_lr)
             epochs_without_lr_improvement = 0
             if not has_decayed_once:
                 has_decayed_once = True
@@ -227,7 +273,7 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
     best_val_loss = float("inf")
     epochs_without_improvement = 0
     history = {"epoch": [], "loss": [], "val_loss": [], "val_accuracy": []}
-    os.makedirs(train_name, exist_ok=True)  # creates Bert_Full_Weight_Fine_Tune/<run name>/ (and the top folder if missing)
+    os.makedirs(train_name, exist_ok=True)  # creates Lora_Models/<run name>/ (and Lora_Models/ itself if missing)
     global_step = 0  # counts batches across the whole run, for the warmup ramp below
 
     # two-stage lr decay: patience=1 for the first decay (react fast), patience=3
@@ -241,7 +287,7 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
     # range, so there's no overflow/underflow risk and no GradScaler needed at all
     for epoch in range(num_epochs):
         model.train()
-        bert_model.train()  # unfrozen BERT layers need dropout active during training too
+        bert_model.train()  # LoRA layers need their dropout active during training too
         running_loss = 0.0
         num_batches = len(train_loader)
         for batch_idx, (test_input, test_output) in enumerate(train_loader):
@@ -259,7 +305,7 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
             # dtype here follows each op's original forward-pass dtype (bf16 for the autocast ops above), not this line's position outside the with block.
             # So not the default fp since forward used bf.
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]["params"], max_norm=1.0)  # cap extreme gradients before they hit the optimizer
+            torch.nn.utils.clip_grad_norm_([p for g in optimizer.param_groups for p in g["params"]], max_norm=1.0)  # cap extreme gradients before they hit the optimizer (head + LoRA params)
             optimizer.step()
 
             # stop incrementing once past warmup_steps — nothing downstream reads the
@@ -267,7 +313,7 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
             # result is already locked in permanently once it crosses the threshold once
             if global_step <= warmup_steps:
                 global_step += 1
-            apply_warmup(optimizer, global_step, warmup_steps, base_lr)
+            apply_warmup(optimizer, global_step, warmup_steps, base_lrs)
 
             print(f"  epoch {epoch + 1} batch {batch_idx}/{num_batches} loss={loss.item():.4f}")
 
@@ -296,21 +342,22 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
                 optimizer, val_accuracy, best_val_accuracy, epochs_without_lr_improvement, has_decayed_once, lr_patience
             ) #apply decay with patience of 3 (original function)
 
-        print(f"--- Epoch {epoch + 1}: train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f} lr={optimizer.param_groups[0]['lr']:.2e} ---")
+        print(f"--- Epoch {epoch + 1}: train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f} lr(head)={optimizer.param_groups[0]['lr']:.2e} lr(lora)={optimizer.param_groups[1]['lr']:.2e} ---")
 
-        #early stop — only once lr has bottomed out at MIN_LR; before that, the lr
+        #early stop — only once every lr group has bottomed out at its floor; before that, the lr
         # decay above still has room to try a gentler rate, so don't give up yet
-        current_lr = optimizer.param_groups[0]["lr"]
+        at_min_lr = all(g["lr"] <= floor for g, floor in zip(optimizer.param_groups, min_lrs))
         if val_loss <= best_val_loss:
             best_val_loss = val_loss
             epochs_without_improvement = 0
             # save the best checkpoint as soon as we see it — training can keep
             # running a long time after this (early stop is gated on lr reaching
-            # MIN_LR), and the model can overfit in the meantime. Without this,
+            # the floor), and the model can overfit in the meantime. Without this,
             # we'd only ever have access to whatever the LAST epoch looked like.
+            # Head + LoRA adapter weights only: the rest of BERT is frozen and never changes.
             torch.save(model.state_dict(), os.path.join(train_name, "head.pt"))
-            torch.save(bert_model.state_dict(), os.path.join(train_name, "bert.pt"))
-        elif current_lr <= MIN_LR:
+            torch.save(get_peft_model_state_dict(bert_model), os.path.join(train_name, "lora_adapter.pt"))
+        elif at_min_lr:
             epochs_without_improvement += 1 #apply decay with patience of 5 once reach min (special not related to the original function of
             # patience of 3 decay and dividing by 2.
             if epochs_without_improvement >= patience:
@@ -322,7 +369,7 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
     hist_data.to_csv(os.path.join(train_name, "history.csv"), index=False)
 
 
-train_name = os.path.join("Bert_Full_Weight_Fine_Tune", "bert_large")  # all outputs go in Bert_Full_Weight_Fine_Tune/bert_large/
+train_name = os.path.join("Lora_Models", "head_only_lora_all_layers")  # all outputs go in Lora_Models/head_only_lora_all_layers/ (own folder, can't overwrite other scripts' or the top-2 variant's outputs)
 train(final_model, optimizer, loss_function, loader, 5, train_name)
 # checkpoints are saved inside train() as soon as a new best val_loss is seen —
 # nothing to save here, that would overwrite the best with the final epoch's state
@@ -331,8 +378,9 @@ train(final_model, optimizer, loss_function, loader, 5, train_name)
 # block below would just evaluate whatever's left in memory (the LAST epoch),
 # not the best one that got saved to disk during training.
 final_model.load_state_dict(torch.load(os.path.join(train_name, "head.pt"), map_location=device))
-bert_model.load_state_dict(torch.load(os.path.join(train_name, "bert.pt"), map_location=device))
-print(f"Reloaded best checkpoint (by val_loss) from {train_name}/head.pt and {train_name}/bert.pt for testing")
+set_peft_model_state_dict(bert_model, torch.load(os.path.join(train_name, "lora_adapter.pt"), map_location=device))
+print(f"Reloaded best checkpoint (by val_loss) from {train_name}/head.pt and {train_name}/lora_adapter.pt for testing")
+bert_model.save_pretrained(os.path.join(train_name, "lora_adapter_hf"))  # best LoRA adapter in HF format (small), not the full BERT
 
 
 #End of train and TEST model
@@ -360,12 +408,12 @@ with torch.no_grad():          # no gradient tracking for specific (diff way tha
         "recall": rec.item(),
         "f1": f1.item(),
     }])
-    test_metrics.to_csv(os.path.join(train_name, "test_metrics.csv"), index=False)
+    test_metrics.to_csv(os.path.join(train_name, "test_metrics.csv"), index=False)  # own name, avoids overwriting other scripts' results
 
     # save per-example true/predicted labels for the confusion matrix
     predictions = pd.DataFrame({
         "true_label": y_test_true.cpu().numpy(),
         "pred_label": pred.cpu().numpy(),
     })
-    predictions.to_csv(os.path.join(train_name, "test_predictions.csv"), index=False)
+    predictions.to_csv(os.path.join(train_name, "test_predictions.csv"), index=False)  # own name, avoids overwriting other scripts' results
 
