@@ -321,7 +321,7 @@ def train(model, optimizer, loss_function, train_loader, patience, train_name):
     hist_data.to_csv(os.path.join(train_name, "history.csv"), index=False)
 
 
-train_name = os.path.join("Bert_Full_Weight_Fine_Tune", "bert_small")  # all outputs go in Bert_Full_Weight_Fine_Tune/bert_small/ (own folder, can't overwrite main.py's)
+train_name = os.path.join("Bert_Full_Weight_Fine_Tune", "bert_small")  # all outputs go in Bert_Full_Weight_Fine_Tune/bert_small/ (own folder, can't overwrite Bert_Full_Large.py's)
 train(final_model, optimizer, loss_function, loader, 5, train_name)
 # checkpoints are saved inside train() as soon as a new best val_loss is seen —
 # nothing to save here, that would overwrite the best with the final epoch's state

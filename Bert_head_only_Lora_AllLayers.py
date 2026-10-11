@@ -18,9 +18,9 @@ tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-large-uncased")
 bert_model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
 
 # VARIANT ALL LAYERS: LoRA on ALL 24 encoder layers (the standard HF/PEFT setup). Compare with
-# head_only_Lora_Top2.py, which adapts only the top 2 layers.
+# Bert_head_only_Lora_Top2.py, which adapts only the top 2 layers.
 # (get_peft_model freezes every base weight, only the LoRA adapters + the DNN head train).
-# This is the one intended difference from main.py (full fine-tune).
+# This is the one intended difference from Bert_Full_Large.py (full fine-tune).
 # Config follows current best-practice guidance:
 #  - target ALL linear matrices in those layers (attention q/k/v/output + the MLP's two
 #    dense layers) — attention-only LoRA underperforms ("LoRA Without Regret")
@@ -119,22 +119,15 @@ def get_embedding(text, device): #(using BERT)
     # no blanket no_grad here: the LoRA layers need gradients during training.
     # Callers wrap this in torch.no_grad() for eval.
 
-    # Pooler output (BERT's own pooling layer, applied to the [CLS] token):
-    #
-    #   [Linear Layer]
-    #          │
-    #          ▼
-    #   [Tanh / Sigmoid Activation]
-    #          │
-    #          ▼
-    #   [Pooler Output]  ──> (Ready for your custom Linear + Sigmoid/Softmax)
-    #
-    # (BERT's pooler uses Tanh.)
-    return outputs.pooler_output  # (batch, 1024) — BERT's own [CLS]-based summary of the sequence
-    #pooler_output = tanh(Linear(last_hidden_state[:, 0, :]))
-    # This is the same setup BERT's original paper and GLUE benchmark used, and
-    # what HuggingFace's BertForSequenceClassification does by default.
-    # The pooler itself is frozen here (LoRA only touches the encoder layers).
+    # Mean pooling: average every real token's last-layer vector (padding masked out).
+    # NOT pooler_output: the pooler (tanh(Linear([CLS]))) stays frozen under LoRA and was only
+    # pretrained for next-sentence prediction — ~73% of its values sit pinned at ±1, where tanh's
+    # gradient is ~0, so almost no signal reached the LoRA layers (the pooler_output version of
+    # the top-2 variant never got off the 1.0986 = ln(3) random-guess loss). Mean pooling reads
+    # the encoder output directly, so the LoRA layers get a real gradient.
+    # fp32 before averaging: summing hundreds of bf16 token vectors loses precision
+    mask = inputs["attention_mask"].unsqueeze(-1).float()  # (batch, seq, 1): 1 = real token, 0 = padding
+    return (outputs.last_hidden_state.float() * mask).sum(dim=1) / mask.sum(dim=1)  # (batch, 1024)
 
 class SimpleNeuralNet(nn.Module):
     def __init__(self, input_size, hidden_size, num_classes): #initiallize
@@ -167,12 +160,13 @@ loss_function = nn.CrossEntropyLoss(weight=class_weights)
 
 lora_params = [p for p in bert_model.parameters() if p.requires_grad]  # only the LoRA A/B matrices are trainable in BERT
 # DNN head keeps the original lr of 1e-3 (it starts random and learns from scratch).
-# LoRA adapters get 2e-4 (10x the 2e-5 full fine-tuning uses, per the "LoRA Without Regret"
+# LoRA adapters get 5e-5 (was 2e-4; at 2e-4 this all-24-layer variant learned well in epoch 1, then diverged
+# in epoch 3 and collapsed to always predicting one class). Still above the 2e-5 full fine-tuning uses, per the "LoRA Without Regret"
 # guidance): they start as a no-op (B=0) and are tiny, so they need larger steps than full
 # fine-tuning to have any effect.
 # AdamW vs Adam: decouples weight decay from the gradient update instead of blending them together — standard practice for larger models like BERT
 base_lr = 1e-3
-lora_lr = 2e-4
+lora_lr = 5e-5
 optimizer = torch.optim.AdamW([
     {"params": list(final_model.parameters()), "lr": base_lr},
     {"params": lora_params, "lr": lora_lr},
@@ -206,8 +200,8 @@ warmup_steps = len(loader) * 1
 LR_DECAY_FACTOR = 0.5
 # Floors, per lr group (each decay halves both groups, never below that group's own floor):
 #   DNN head : 10% of its 1e-3 peak = 1e-4
-#   LoRA     : 10% of its 2e-4 peak = 2e-5
-# 10% of peak (the usual LoRA min_lr_ratio=0.1), NOT main.py's near-zero 1e-7: a floor that low
+#   LoRA     : 10% of its 5e-5 peak = 5e-6
+# 10% of peak (the usual LoRA min_lr_ratio=0.1), NOT Bert_Full_Large.py's near-zero 1e-7: a floor that low
 # would freeze the adapters, and LoRA keeps learning usefully at a small lr.
 # Early stopping only counts once BOTH groups are at their floor (~4 halvings).
 MIN_LR_RATIO = 0.1
