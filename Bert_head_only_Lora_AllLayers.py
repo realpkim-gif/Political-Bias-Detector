@@ -17,6 +17,21 @@ print(device)
 tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-large-uncased")
 bert_model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
 
+# What this model is: frozen BERT + the DNN head + LoRA adapters on ALL 24 of BERT's layers.
+#
+#   article -> BERT layers 1-24  frozen + trainable LoRA adapters in every layer
+#           -> mean pooling -> DNN head (fc1 -> fc2 -> fc3, trains) -> LEFT / CENTER / RIGHT
+#
+# BERT's 335M original weights never change. In every layer, LoRA adds a small trainable A x B pair to
+# 6 matrices (attention Q, K, V, attention output, and the 2 MLP dense layers) = 294,912 params per layer,
+# 7,077,888 total (~2% of BERT; Top2 trains 589,824). So every level, from how words are read at the bottom
+# to how meaning is built at the top, gets a small learned correction for political bias.
+# vs full fine-tune (Bert_Full_Large.py / Bert_Full_Small.py): those change every real BERT weight and save a
+# full BERT copy (bert.pt, 1.3 GB for large); this saves only the adapters (lora_adapter.pt, ~28 MB), and
+# because only small add-ons train it can't overfit as aggressively.
+# Needs a lower LoRA lr than Top2: 24 layers of changes add up (at 2e-4 it diverged in epoch 3 and collapsed).
+# Test results: acc 0.859 / f1 0.851 (lr 5e-5) — the best of all the models.
+#
 # VARIANT ALL LAYERS: LoRA on ALL 24 encoder layers (the standard HF/PEFT setup). Compare with
 # Bert_head_only_Lora_Top2.py, which adapts only the top 2 layers.
 # (get_peft_model freezes every base weight, only the LoRA adapters + the DNN head train).
@@ -26,7 +41,7 @@ bert_model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(devi
 #    dense layers) — attention-only LoRA underperforms ("LoRA Without Regret")
 #  - r=16, alpha=2*r (standard rule of thumb), small dropout since the earlier full
 #    fine-tune overfit hard
-#  - LoRA lr ~10x what full fine-tuning uses (see optimizer below)
+#  - LoRA lr above what full fine-tuning uses (5e-5 here vs 2e-5; see optimizer below)
 num_bert_layers = bert_model.config.num_hidden_layers
 NUM_LORA_LAYERS = num_bert_layers  # all 24 layers (Top2 variant uses 2)
 lora_config = LoraConfig(
