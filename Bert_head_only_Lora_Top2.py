@@ -17,6 +17,19 @@ print(device)
 tokenizer = AutoTokenizer.from_pretrained("google-bert/bert-large-uncased")
 bert_model = AutoModel.from_pretrained("google-bert/bert-large-uncased").to(device)
 
+# What this model is: frozen BERT + the DNN head + LoRA adapters on ONLY the last 2 of BERT's 24 layers.
+#
+#   article -> BERT layers 1-22   frozen, run exactly as pretrained (general language: grammar, word meaning)
+#           -> BERT layers 23-24  frozen + trainable LoRA adapters (small learned corrections for political bias)
+#           -> mean pooling -> DNN head (fc1 -> fc2 -> fc3, trains) -> LEFT / CENTER / RIGHT
+#
+# BERT's 335M original weights never change. In each of the 2 layers, LoRA adds a small trainable A x B pair
+# to 6 matrices (attention Q, K, V, attention output, and the 2 MLP dense layers) = 294,912 params per layer,
+# 589,824 total (~0.18% of BERT). Only the top layers are adapted because they hold the most abstract,
+# task-shaped features; the lower layers' general language features are left alone.
+# Middle ground: beats head-only (BERT's top can adapt) but trails all-layers LoRA, since layers 1-22 can't
+# adjust to political text. Test results: acc 0.809 / f1 0.799 (lr 2e-4; a 5e-5 retry scored lower, f1 0.782).
+#
 # VARIANT TOP2: LoRA on ONLY the top NUM_LORA_LAYERS (2) encoder layers; everything else in BERT stays
 # frozen. Compare with Bert_head_only_Lora_AllLayers.py, which adapts all 24 layers.
 # (get_peft_model freezes every base weight, only the LoRA adapters + the DNN head train).
