@@ -124,12 +124,13 @@ def plot_confusion_matrix(csv_path="Bert_Full_Weight_Fine_Tune/bert_large/test_p
     plt.close(fig)
 
 
-# the 4 trained models: display name -> the folder its training script saves into
+# the 5 trained models: display name -> the folder its training script saves into
 RUNS = {
     "BERT-large full fine-tune": "Bert_Full_Weight_Fine_Tune/bert_large",
     "BERT-small full fine-tune": "Bert_Full_Weight_Fine_Tune/bert_small",
     "LoRA top 2 layers": "Lora_Models/head_only_lora_top2",
     "LoRA all 24 layers": "Lora_Models/head_only_lora_all_layers",
+    "Frozen BERT, head only": "Head_Only/head_only",
 }
 
 
